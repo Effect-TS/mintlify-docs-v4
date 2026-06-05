@@ -90,25 +90,84 @@ const program = Effect.gen(function*() {
 })
 ```
 
-## Using Effect.fn for Reusable Functions
+## Defining reusable effect functions
 
-When writing functions that return an Effect, use `Effect.fn` to use the generator syntax:
+When you write a function that returns an Effect, prefer `Effect.fn` or `Effect.fnUntraced` over a plain function that returns `Effect.gen`. Both reuse the generator body across calls instead of allocating a fresh closure on every invocation.
+
+### Effect.fn
+
+Use `Effect.fn` when you want a stack-frame boundary or tracing span around the function. There are two forms:
+
+- `Effect.fn(body, ...transforms)` adds a generic stack-frame boundary without creating a span.
+- `Effect.fn("operationName", options?)(body, ...transforms)` adds a named boundary and creates a tracing span when the returned Effect runs. The optional `SpanOptionsNoTrace` configures span attributes, links, parent or root selection, kind, sampling, and log level.
+
+Any arguments after the generator body behave like `pipe` transforms: each receives the previous result and the original function arguments.
 
 ```ts
 import { Effect } from "effect"
 
-// Define a reusable effect function
+// Named form: produces a tracing span called "processUser"
 export const processUser = Effect.fn("processUser")(
   function*(userId: number): Effect.fn.Return<string, Error> {
     yield* Effect.logInfo("Processing user:", userId)
-    
+
     const user = yield* fetchUser(userId)
     const validated = yield* validateUser(user)
-    
+
     return validated.name
   }
 )
 ```
+
+To bind `this` inside the generator, pass `{ self }` before the body:
+
+```ts
+import { Effect } from "effect"
+
+class Counter {
+  count = 0
+
+  increment = Effect.fn("Counter.increment")(
+    { self: this },
+    function*(this: Counter, by: number) {
+      this.count += by
+      return yield* Effect.succeed(this.count)
+    }
+  )
+}
+```
+
+### Effect.fnUntraced
+
+Use `Effect.fnUntraced` when tracing spans and stack-frame capture are not needed. It reuses the generator body in the same way as `Effect.fn`, but skips the Effect stack-frame boundary and does not create a span, so it carries less overhead.
+
+```ts
+import { Effect } from "effect"
+
+const lengthOf = Effect.fnUntraced(function*(value: string) {
+  return yield* Effect.succeed(value.length)
+})
+
+//      ┌─── Effect.Effect<number>
+//      ▼
+const program = lengthOf("hello")
+```
+
+`fnUntraced` also accepts trailing `pipe`-style transforms:
+
+```ts
+import { Effect } from "effect"
+
+const describe = Effect.fnUntraced(
+  function*(value: string) {
+    return yield* Effect.succeed(value.length)
+  },
+  (effect, value) =>
+    effect.pipe(Effect.map((length) => `${value}: ${length}`))
+)
+```
+
+When the produced Effect type needs to be stated explicitly — for example on parametric generators — annotate the return with `Effect.fn.Return<A, E, R>`.
 
 ## Error Handling
 
