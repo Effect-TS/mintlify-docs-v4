@@ -16,50 +16,33 @@ The `effect/unstable/workflow` modules provide tools for building durable workfl
 
 Workflows are durable execution contexts that can:
 
-- **Persist state** — Workflow state is stored and restored across restarts
-- **Handle delays** — Wait for hours, days, or weeks without blocking
-- **Coordinate activities** — Orchestrate multiple operations across services
-- **Recover from failures** — Automatically retry failed activities
+- **Persist state** — workflow progress is stored and restored across restarts
+- **Handle delays** — wait for hours, days, or weeks without blocking
+- **Coordinate activities** — orchestrate multiple operations across services
+- **Recover from failures** — automatically retry failed activities
 
 ## Defining a workflow
 
-A workflow is defined with `Workflow.make(tag, options)`. The execution body is
-attached separately via `workflow.toLayer(execute)`. This mirrors how
+A workflow is defined with `Workflow.make(tag, options)`. The execution body
+is attached separately via `workflow.toLayer(execute)`. This mirrors how
 [`Rpc.make`](/unstable/rpc) is structured.
 
 ```typescript
 import { Effect, Schema } from "effect"
 import { Workflow } from "effect/unstable/workflow"
 
-const ProcessOrder = Workflow.make("ProcessOrder", {
-  payload: {
-    orderId: Schema.String,
-    items: Schema.Array(Schema.String)
-  },
-  success: Schema.Struct({
-    orderId: Schema.String,
-    status: Schema.String
-  }),
-  idempotencyKey: ({ orderId }) => orderId
+const IncrementWorkflow = Workflow.make("IncrementWorkflow", {
+  payload: { value: Schema.Number },
+  success: Schema.Number,
+  idempotencyKey: ({ value }) => String(value)
 })
 
-const ProcessOrderLayer = ProcessOrder.toLayer((payload) =>
-  Effect.gen(function*() {
-    // Reserve inventory
-    yield* reserveInventory(payload)
-
-    // Wait for payment (could be hours or days)
-    yield* Effect.sleep("24 hours")
-
-    // Ship the order
-    yield* shipOrder(payload)
-
-    return { orderId: payload.orderId, status: "shipped" }
-  })
+const IncrementWorkflowLayer = IncrementWorkflow.toLayer(({ value }) =>
+  Effect.succeed(value + 1)
 )
 ```
 
-`Workflow.make` accepts the following options:
+`Workflow.make` accepts these options:
 
 - `payload` — a `Schema.Struct` field map (or a struct schema) describing the workflow input
 - `idempotencyKey` — pure function from the payload to a deterministic key used to derive the workflow's execution ID
@@ -87,27 +70,10 @@ const IncrementWorkflowLayer = IncrementWorkflow.toLayer(({ value }) =>
 )
 ```
 
-## Activities
-
-Activities are the units of work performed inside a workflow. They are executed
-through the `Workflow.Workflow` service available in the execution body:
-
-```typescript
-import { Activity } from "effect/unstable/workflow"
-
-const reserveInventory = Activity.make(
-  "reserveInventory",
-  (input: { orderId: string }) => Effect.gen(function*() {
-    const inventory = yield* InventoryService
-    yield* inventory.reserve(input.orderId)
-  })
-)
-```
-
 ## Executing workflows
 
 Call `workflow.execute(payload)` to run the workflow and await its result, or
-pass `{ discard: true }` to fire-and-forget and just receive the deterministic
+pass `{ discard: true }` to fire-and-forget and receive just the deterministic
 execution ID:
 
 ```typescript
@@ -115,54 +81,149 @@ import { Effect, Layer } from "effect"
 import { WorkflowEngine } from "effect/unstable/workflow"
 
 const program = Effect.gen(function*() {
-  // Await the result
-  const result = yield* ProcessOrder.execute({
-    orderId: "order-123",
-    items: ["item1", "item2"]
-  })
+  // Await the result — typed as the workflow's success schema
+  const result = yield* IncrementWorkflow.execute({ value: 1 })
 
-  // Or fire-and-forget — returns the deterministic execution ID
-  const executionId = yield* ProcessOrder.execute(
-    { orderId: "order-123", items: ["item1", "item2"] },
+  // Fire-and-forget — returns the deterministic execution ID
+  const executionId = yield* IncrementWorkflow.execute(
+    { value: 1 },
     { discard: true }
   )
 
   return { result, executionId }
 }).pipe(
-  Effect.provide(ProcessOrderLayer.pipe(
+  Effect.provide(IncrementWorkflowLayer.pipe(
     Layer.provideMerge(WorkflowEngine.layerMemory)
   ))
 )
 ```
+
+`WorkflowEngine.layerMemory` is an in-memory engine that's handy for tests and
+development. Production deployments wire a persistent engine in its place.
 
 ## Polling and execution IDs
 
 You can derive an execution ID up front, then poll for the workflow's outcome:
 
 ```typescript
+import { Effect, Option } from "effect"
+import { Workflow } from "effect/unstable/workflow"
+
 const program = Effect.gen(function*() {
-  const executionId = yield* ProcessOrder.executionId({
-    orderId: "order-123",
-    items: ["item1", "item2"]
-  })
+  const executionId = yield* IncrementWorkflow.executionId({ value: 1 })
 
-  yield* ProcessOrder.execute(
-    { orderId: "order-123", items: ["item1", "item2"] },
-    { discard: true }
-  )
+  yield* IncrementWorkflow.execute({ value: 1 }, { discard: true })
 
-  const polled = yield* ProcessOrder.poll(executionId)
-  return polled
+  const polled = yield* IncrementWorkflow.poll(executionId)
+  if (Option.isSome(polled) && polled.value._tag === "Complete") {
+    return polled.value.exit
+  }
+  return null
 })
 ```
 
-## Resuming suspended workflows
+## Activities
 
-If a workflow is suspended (for example, waiting on a long sleep), it can be
-resumed by execution ID:
+`Activity.make` wraps an effect so the engine can persist its result and
+replay it on subsequent runs. Activities are defined with an options object:
 
 ```typescript
-yield* ProcessOrder.resume(executionId)
+import { Effect, Schema } from "effect"
+import { Activity } from "effect/unstable/workflow"
+
+const reserveInventory = Activity.make({
+  name: "reserveInventory",
+  success: Schema.Void,
+  error: Schema.String,
+  execute: Effect.gen(function*() {
+    // Do the work...
+    yield* Effect.log("Reserving inventory")
+  })
+})
+```
+
+Use the activity inside a workflow body by `yield*`-ing it:
+
+```typescript
+const OrderWorkflow = Workflow.make("OrderWorkflow", {
+  payload: { orderId: Schema.String },
+  idempotencyKey: ({ orderId }) => orderId
+})
+
+const OrderWorkflowLayer = OrderWorkflow.toLayer(({ orderId }) =>
+  Effect.gen(function*() {
+    yield* reserveInventory
+    yield* Effect.log(`Reserved inventory for ${orderId}`)
+  })
+)
+```
+
+`Activity.retry` re-runs an activity while updating its
+`Activity.CurrentAttempt`, and `Activity.idempotencyKey` derives a deterministic
+key from the current execution ID and a name.
+
+## Durable sleeps
+
+`DurableClock.sleep` waits inside a workflow. Short durations run in memory; long
+durations are persisted and resumed when the timer fires:
+
+```typescript
+import { DurableClock } from "effect/unstable/workflow"
+
+yield* DurableClock.sleep({
+  name: "wait-for-payment",
+  duration: "24 hours"
+})
+```
+
+Each sleep needs a stable `name` so the engine can correlate it with the
+persisted timer on resume.
+
+## Durable signals with DurableDeferred
+
+To pause a workflow until an external event arrives, use `DurableDeferred`. The
+deferred is awaited inside the workflow and completed from the outside (or from
+another workflow):
+
+```typescript
+import { Effect, Schema } from "effect"
+import { DurableDeferred, Workflow } from "effect/unstable/workflow"
+
+const ApprovalDeferred = DurableDeferred.make("approval", {
+  success: Schema.Boolean
+})
+
+const ApprovalWorkflow = Workflow.make("ApprovalWorkflow", {
+  payload: { orderId: Schema.String },
+  success: Schema.String,
+  idempotencyKey: ({ orderId }) => orderId
+})
+
+const ApprovalWorkflowLayer = ApprovalWorkflow.toLayer(({ orderId }) =>
+  Effect.gen(function*() {
+    const approved = yield* DurableDeferred.await(ApprovalDeferred)
+    return approved ? `${orderId}:approved` : `${orderId}:rejected`
+  })
+)
+
+// From outside the workflow (e.g. an HTTP handler), complete the deferred:
+const approve = (executionId: string) =>
+  Effect.gen(function*() {
+    const token = yield* DurableDeferred.tokenFromExecutionId(
+      ApprovalDeferred,
+      executionId
+    )
+    yield* DurableDeferred.succeed(ApprovalDeferred, { token, value: true })
+  })
+```
+
+## Resuming and interrupting
+
+A suspended workflow can be resumed or interrupted by execution ID:
+
+```typescript
+yield* IncrementWorkflow.resume(executionId)
+yield* IncrementWorkflow.interrupt(executionId)
 ```
 
 The `suspendedRetrySchedule` option on `Workflow.make` controls the schedule
@@ -172,7 +233,12 @@ used when retrying a suspended workflow.
 
 ```typescript
 import { Effect, Layer, Schema } from "effect"
-import { Workflow, WorkflowEngine } from "effect/unstable/workflow"
+import {
+  Activity,
+  DurableClock,
+  Workflow,
+  WorkflowEngine
+} from "effect/unstable/workflow"
 
 const ProcessOrder = Workflow.make("ProcessOrder", {
   payload: {
@@ -186,17 +252,34 @@ const ProcessOrder = Workflow.make("ProcessOrder", {
   idempotencyKey: ({ orderId }) => orderId
 })
 
+const reserveInventory = Activity.make({
+  name: "reserveInventory",
+  execute: Effect.log("Reserving inventory")
+})
+
+const chargePayment = Activity.make({
+  name: "chargePayment",
+  execute: Effect.log("Charging payment")
+})
+
+const shipOrder = Activity.make({
+  name: "shipOrder",
+  execute: Effect.log("Shipping order")
+})
+
 const ProcessOrderLayer = ProcessOrder.toLayer((payload) =>
   Effect.gen(function*() {
-    yield* Effect.log(`Processing order ${payload.orderId}`)
+    yield* reserveInventory
+    yield* chargePayment
 
-    yield* Effect.log("Reserving inventory")
-    yield* Effect.sleep("1 second")
+    // Wait one day before shipping
+    yield* DurableClock.sleep({
+      name: "fulfillment-delay",
+      duration: "1 day"
+    })
 
-    yield* Effect.log("Charging payment")
-    yield* Effect.sleep("1 second")
+    yield* shipOrder
 
-    yield* Effect.log("Shipping order")
     return { orderId: payload.orderId, status: "shipped" }
   })
 )
@@ -206,7 +289,6 @@ const program = Effect.gen(function*() {
     orderId: "order-456",
     items: ["item1", "item2"]
   })
-
   yield* Effect.log(`Order ${result.orderId} ${result.status}`)
 }).pipe(
   Effect.provide(ProcessOrderLayer.pipe(
@@ -217,13 +299,13 @@ const program = Effect.gen(function*() {
 
 ## Use cases
 
-- **Order processing** — Handle multi-step order fulfillment
-- **Approval flows** — Wait for human approval in business processes
-- **Scheduled tasks** — Run tasks at specific times or intervals
-- **Sagas** — Coordinate distributed transactions
-- **Event-driven processes** — React to events over long periods
+- **Order processing** — multi-step order fulfillment
+- **Approval flows** — wait for human approval in business processes
+- **Scheduled tasks** — run tasks at specific times or intervals
+- **Sagas** — coordinate distributed transactions
+- **Event-driven processes** — react to events over long periods
 
 ## See also
 
-- [Cluster](/unstable/cluster) — Distribute workflows across nodes
-- [RPC](/unstable/rpc) — Define workflow activities
+- [Cluster](/unstable/cluster) — distribute workflows across nodes
+- [RPC](/unstable/rpc) — define typed inter-service calls
