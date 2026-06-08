@@ -8,10 +8,12 @@ description: "Build HTTP servers with routing and middleware using Effect"
 The `effect/unstable/http` modules provide tools for building HTTP servers with
 routing, middleware, and typed request handling.
 
-The router is built up as a `Layer` — each route, group of routes, or
-middleware is a layer that requires the `HttpRouter` service. You then hand the
-combined application layer to `HttpRouter.serve` (long-running server) or
-`HttpRouter.toWebHandler` (serverless `fetch`-style handler).
+The router is built up as a `Layer` that requires the `HttpRouter` service. The
+recommended entry point is `HttpRouter.use`: it gives you direct access to the
+router so you can register every route and middleware inside one effectful
+block. You then hand the combined application layer to `HttpRouter.serve` (a
+long-running server) or `HttpRouter.toWebHandler` (a serverless `fetch`-style
+handler).
 
 ## Creating a server
 
@@ -21,13 +23,11 @@ import { Effect, Layer } from "effect"
 import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 import { createServer } from "node:http"
 
-const HealthRoute = HttpRouter.add(
-  "GET",
-  "/health",
-  Effect.succeed(HttpServerResponse.text("ok"))
+const AppLive = HttpRouter.use((router) =>
+  router.add("GET", "/health", HttpServerResponse.text("ok"))
 )
 
-const ServerLive = HttpRouter.serve(HealthRoute).pipe(
+const ServerLive = HttpRouter.serve(AppLive).pipe(
   Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
 )
 
@@ -36,89 +36,80 @@ Layer.launch(ServerLive).pipe(NodeRuntime.runMain)
 
 ## Routing
 
-### Defining routes
+### Registering routes with `HttpRouter.use`
 
-`HttpRouter.add` returns a `Layer` that registers a single route. A handler can
-be a plain `HttpServerResponse`, an `Effect` producing one, or a function from
-the request to such an effect.
-
-```typescript
-import { Effect } from "effect"
-import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
-
-const HelloRoute = HttpRouter.add(
-  "GET",
-  "/",
-  HttpServerResponse.text("Welcome")
-)
-
-const EchoRoute = HttpRouter.add(
-  "POST",
-  "/echo",
-  (request) =>
-    Effect.map(request.text, (body) => HttpServerResponse.text(body))
-)
-```
-
-### Combining routes
-
-Use `Layer.mergeAll` to combine multiple route layers into a single application
-layer:
-
-```typescript
-import { Layer } from "effect"
-
-const AppLayer = Layer.mergeAll(HelloRoute, EchoRoute)
-```
-
-For larger groups, build an array of `HttpRouter.route(...)` values and register
-them with `HttpRouter.addAll`:
+`HttpRouter.use((router) => Effect)` returns a `Layer` whose body runs with the
+router in scope. Call `router.add(method, path, handler)` for each route — a
+handler can be an `HttpServerResponse` value, an `Effect` producing one, or a
+function from the request to such an effect.
 
 ```typescript
 import { Effect } from "effect"
 import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 
-const ApiRoutes = HttpRouter.addAll(
-  [
-    HttpRouter.route(
+const AppLive = HttpRouter.use((router) =>
+  Effect.gen(function*() {
+    yield* router.add(
       "GET",
-      "/users",
-      Effect.succeed(HttpServerResponse.text("users"))
-    ),
-    HttpRouter.route(
-      "POST",
-      "/users",
-      Effect.succeed(HttpServerResponse.text("created"))
+      "/",
+      HttpServerResponse.text("Welcome")
     )
-  ],
-  { prefix: "/api" }
+
+    yield* router.add(
+      "POST",
+      "/echo",
+      (request) =>
+        Effect.map(request.text, (body) => HttpServerResponse.text(body))
+    )
+
+    yield* router.add(
+      "GET",
+      "/users/:id",
+      Effect.gen(function*() {
+        const params = yield* HttpRouter.params
+        return HttpServerResponse.text(`user ${params.id}`)
+      })
+    )
+  })
 )
 ```
-
-### Path parameters
 
 Path segments prefixed with `:` are captured and exposed by the
-`HttpRouter.params` effect:
+`HttpRouter.params` effect inside any handler.
+
+### Grouping routes with a prefix
+
+`router.prefixed(prefix)` returns a router whose subsequent `add` calls are
+mounted under that prefix:
 
 ```typescript
 import { Effect } from "effect"
 import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 
-const UserRoute = HttpRouter.add(
-  "GET",
-  "/users/:id",
+const AppLive = HttpRouter.use((router) =>
   Effect.gen(function*() {
-    const params = yield* HttpRouter.params
-    return HttpServerResponse.text(`user ${params.id}`)
+    const api = router.prefixed("/api")
+
+    yield* api.add(
+      "GET",
+      "/users",
+      HttpServerResponse.text("users")
+    )
+
+    yield* api.add(
+      "POST",
+      "/users",
+      HttpServerResponse.text("created")
+    )
   })
 )
 ```
 
 ### Schema-decoded inputs
 
-`HttpRouter.schemaJson` decodes the request (method, URL, headers, cookies,
-path params, search params, and JSON body) against a schema in one step. Use
-`HttpRouter.schemaPathParams` and `HttpRouter.schemaNoBody` for the
+`HttpRouter.schemaJson` decodes the entire request (method, URL, headers,
+cookies, path params, search params, and JSON body) against a schema in one
+step. `HttpRouter.schemaPathParams` and `HttpRouter.schemaNoBody` cover the
 non-body cases.
 
 ```typescript
@@ -132,13 +123,15 @@ const CreateUser = Schema.Struct({
   })
 })
 
-const CreateUserRoute = HttpRouter.add(
-  "POST",
-  "/users",
-  Effect.gen(function*() {
-    const { body } = yield* HttpRouter.schemaJson(CreateUser)
-    return HttpServerResponse.text(`created ${body.name}`)
-  })
+const AppLive = HttpRouter.use((router) =>
+  router.add(
+    "POST",
+    "/users",
+    Effect.gen(function*() {
+      const { body } = yield* HttpRouter.schemaJson(CreateUser)
+      return HttpServerResponse.text(`created ${body.name}`)
+    })
+  )
 )
 ```
 
@@ -146,7 +139,8 @@ const CreateUserRoute = HttpRouter.add(
 
 ### Accessing the request
 
-Access the current request via the `HttpServerRequest` service:
+Inside a handler, access the request via the `HttpServerRequest` service (or
+through the function form, which receives it as an argument):
 
 ```typescript
 import { Effect } from "effect"
@@ -210,23 +204,30 @@ const Logger = HttpMiddleware.make((app) =>
 
 ### Applying middleware
 
-`HttpRouter.middleware(fn)` returns a `Middleware` whose `.layer` is provided
-to the routes that should use it. Pass `{ global: true }` to apply the
-middleware to every route in the router instead.
+Per-route middleware is provided to the route layer with
+`HttpRouter.middleware(fn).layer`. For middleware that should run on every
+request, register it from inside `HttpRouter.use` via
+`router.addGlobalMiddleware(fn)`.
 
 ```typescript
-import { Layer } from "effect"
-import { HttpRouter } from "effect/unstable/http"
+import { Effect, Layer } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 
-const LoggerMiddleware = HttpRouter.middleware(Logger).layer
+// Apply Logger to every route in the router
+const AppLive = HttpRouter.use((router) =>
+  Effect.gen(function*() {
+    yield* router.addGlobalMiddleware(Logger)
 
-// Scope to specific routes
-const ProtectedRoutes = Layer.mergeAll(UserRoute, CreateUserRoute).pipe(
-  Layer.provide(LoggerMiddleware)
+    yield* router.add("GET", "/", HttpServerResponse.text("ok"))
+  })
 )
 
-// Apply globally to every route in the router
-const GlobalLogger = HttpRouter.middleware(Logger, { global: true })
+// Or scope a middleware layer to a subset of routes
+const Protected = HttpRouter.use((router) =>
+  router.add("GET", "/admin", HttpServerResponse.text("secret"))
+).pipe(
+  Layer.provide(HttpRouter.middleware(Logger).layer)
+)
 ```
 
 ### Built-in middleware
@@ -242,8 +243,7 @@ import { Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 
 const AppLayer = Layer.mergeAll(
-  HelloRoute,
-  UserRoute,
+  AppLive,
   HttpRouter.cors({ allowedOrigins: ["https://example.com"] })
 )
 ```
@@ -280,7 +280,7 @@ cleanup:
 ```typescript
 import { HttpRouter } from "effect/unstable/http"
 
-const { handler, dispose } = HttpRouter.toWebHandler(AppLayer, {
+const { handler, dispose } = HttpRouter.toWebHandler(AppLive, {
   disableLogger: true
 })
 
