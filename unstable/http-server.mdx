@@ -5,61 +5,140 @@ description: "Build HTTP servers with routing and middleware using Effect"
 
 ## Overview
 
-The HTTP Server modules from `effect/unstable/http` provide tools for building HTTP servers with routing, middleware, and request handling.
+The `effect/unstable/http` modules provide tools for building HTTP servers with
+routing, middleware, and typed request handling.
+
+The router is built up as a `Layer` — each route, group of routes, or
+middleware is a layer that requires the `HttpRouter` service. You then hand the
+combined application layer to `HttpRouter.serve` (long-running server) or
+`HttpRouter.toWebHandler` (serverless `fetch`-style handler).
 
 ## Creating a server
 
 ```typescript
 import { NodeHttpServer, NodeRuntime } from "@effect/platform-node"
-import { Layer } from "effect"
-import { HttpRouter, HttpServer } from "effect/unstable/http"
+import { Effect, Layer } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 import { createServer } from "node:http"
 
-const routes = HttpRouter.empty.pipe(
-  HttpRouter.get("/health", HttpRouter.json({ status: "ok" }))
+const HealthRoute = HttpRouter.add(
+  "GET",
+  "/health",
+  Effect.succeed(HttpServerResponse.text("ok"))
 )
 
-const server = HttpRouter.serve(routes).pipe(
+const ServerLive = HttpRouter.serve(HealthRoute).pipe(
   Layer.provide(NodeHttpServer.layer(createServer, { port: 3000 }))
 )
 
-Layer.launch(server).pipe(NodeRuntime.runMain)
+Layer.launch(ServerLive).pipe(NodeRuntime.runMain)
 ```
 
 ## Routing
 
-### Basic routes
+### Defining routes
+
+`HttpRouter.add` returns a `Layer` that registers a single route. A handler can
+be a plain `HttpServerResponse`, an `Effect` producing one, or a function from
+the request to such an effect.
 
 ```typescript
-const routes = HttpRouter.empty.pipe(
-  HttpRouter.get("/", HttpRouter.text("Welcome")),
-  HttpRouter.get("/users", HttpRouter.json(users)),
-  HttpRouter.post("/users", createUserHandler)
+import { Effect } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
+
+const HelloRoute = HttpRouter.add(
+  "GET",
+  "/",
+  HttpServerResponse.text("Welcome")
+)
+
+const EchoRoute = HttpRouter.add(
+  "POST",
+  "/echo",
+  (request) =>
+    Effect.map(request.text, (body) => HttpServerResponse.text(body))
 )
 ```
 
-### Route parameters
+### Combining routes
+
+Use `Layer.mergeAll` to combine multiple route layers into a single application
+layer:
 
 ```typescript
-const routes = HttpRouter.empty.pipe(
-  HttpRouter.get("/users/:id", Effect.gen(function*() {
+import { Layer } from "effect"
+
+const AppLayer = Layer.mergeAll(HelloRoute, EchoRoute)
+```
+
+For larger groups, build an array of `HttpRouter.route(...)` values and register
+them with `HttpRouter.addAll`:
+
+```typescript
+import { Effect } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
+
+const ApiRoutes = HttpRouter.addAll(
+  [
+    HttpRouter.route(
+      "GET",
+      "/users",
+      Effect.succeed(HttpServerResponse.text("users"))
+    ),
+    HttpRouter.route(
+      "POST",
+      "/users",
+      Effect.succeed(HttpServerResponse.text("created"))
+    )
+  ],
+  { prefix: "/api" }
+)
+```
+
+### Path parameters
+
+Path segments prefixed with `:` are captured and exposed by the
+`HttpRouter.params` effect:
+
+```typescript
+import { Effect } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
+
+const UserRoute = HttpRouter.add(
+  "GET",
+  "/users/:id",
+  Effect.gen(function*() {
     const params = yield* HttpRouter.params
-    const userId = params.id
-    // Handle request
-  }))
+    return HttpServerResponse.text(`user ${params.id}`)
+  })
 )
 ```
 
-### Mounting sub-routers
+### Schema-decoded inputs
+
+`HttpRouter.schemaJson` decodes the request (method, URL, headers, cookies,
+path params, search params, and JSON body) against a schema in one step. Use
+`HttpRouter.schemaPathParams` and `HttpRouter.schemaNoBody` for the
+non-body cases.
 
 ```typescript
-const apiRoutes = HttpRouter.empty.pipe(
-  HttpRouter.get("/users", getUsersHandler),
-  HttpRouter.post("/users", createUserHandler)
-)
+import { Effect, Schema } from "effect"
+import { HttpRouter, HttpServerResponse } from "effect/unstable/http"
 
-const routes = HttpRouter.empty.pipe(
-  HttpRouter.mount("/api", apiRoutes)
+const CreateUser = Schema.Struct({
+  body: Schema.Struct({
+    name: Schema.String,
+    age: Schema.Number
+  })
+})
+
+const CreateUserRoute = HttpRouter.add(
+  "POST",
+  "/users",
+  Effect.gen(function*() {
+    const { body } = yield* HttpRouter.schemaJson(CreateUser)
+    return HttpServerResponse.text(`created ${body.name}`)
+  })
 )
 ```
 
@@ -67,48 +146,105 @@ const routes = HttpRouter.empty.pipe(
 
 ### Accessing the request
 
+Access the current request via the `HttpServerRequest` service:
+
 ```typescript
+import { Effect } from "effect"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+
 const handler = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const body = yield* request.json
-  // Process request
+  return HttpServerResponse.text(JSON.stringify(body))
 })
 ```
 
+`request.json`, `request.text`, `request.arrayBuffer`, and `request.stream`
+read the body. `request.cookies`, `request.headers`, `request.method`, and
+`request.url` expose request metadata.
+
 ### Sending responses
 
+`HttpServerResponse` provides constructors for the common cases. `json` and
+`html` (when used as a template tag) return effects because they can fail;
+`text`, `empty`, and `raw` are synchronous values.
+
 ```typescript
-// JSON response
-const handler = HttpRouter.json({ message: "Success" })
+import { Effect } from "effect"
+import { HttpServerResponse } from "effect/unstable/http"
 
 // Text response
-const handler = HttpRouter.text("Hello World")
+const textHandler = HttpServerResponse.text("Hello World")
 
-// Custom response
-const handler = Effect.succeed(
+// JSON response — returns an Effect because serialization can fail
+const jsonHandler = HttpServerResponse.json({ message: "Success" })
+
+// Empty response with a custom status
+const createdHandler = Effect.succeed(
   HttpServerResponse.empty({ status: 201 })
 )
 ```
 
+If you have a known-serializable value and don't want the error in your
+signature, use `HttpServerResponse.jsonUnsafe`.
+
 ## Middleware
 
-### Creating middleware
+### Defining middleware
+
+`HttpMiddleware.make` wraps the per-request handler effect. You can inspect the
+request, run the inner handler, and modify the response.
 
 ```typescript
-const loggingMiddleware = HttpMiddleware.make((request, next) =>
+import { Effect } from "effect"
+import { HttpMiddleware, HttpServerRequest } from "effect/unstable/http"
+
+const Logger = HttpMiddleware.make((app) =>
   Effect.gen(function*() {
+    const request = yield* HttpServerRequest.HttpServerRequest
     yield* Effect.log(`${request.method} ${request.url}`)
-    return yield* next(request)
+    return yield* app
   })
 )
 ```
 
 ### Applying middleware
 
+`HttpRouter.middleware(fn)` returns a `Middleware` whose `.layer` is provided
+to the routes that should use it. Pass `{ global: true }` to apply the
+middleware to every route in the router instead.
+
 ```typescript
-const routes = HttpRouter.empty.pipe(
-  HttpRouter.get("/users", getUsersHandler),
-  HttpRouter.use(loggingMiddleware)
+import { Layer } from "effect"
+import { HttpRouter } from "effect/unstable/http"
+
+const LoggerMiddleware = HttpRouter.middleware(Logger).layer
+
+// Scope to specific routes
+const ProtectedRoutes = Layer.mergeAll(UserRoute, CreateUserRoute).pipe(
+  Layer.provide(LoggerMiddleware)
+)
+
+// Apply globally to every route in the router
+const GlobalLogger = HttpRouter.middleware(Logger, { global: true })
+```
+
+### Built-in middleware
+
+The package ships with a few ready-made middleware layers:
+
+- `HttpRouter.cors(options?)` — applies CORS headers globally
+- `HttpRouter.disableLogger` — silences the request logger for a subset of routes
+- `HttpRouter.provideRequest(layer)` — provides per-request services to a route group
+
+```typescript
+import { Layer } from "effect"
+import { HttpRouter } from "effect/unstable/http"
+
+const AppLayer = Layer.mergeAll(
+  HelloRoute,
+  UserRoute,
+  HttpRouter.cors({ allowedOrigins: ["https://example.com"] })
 )
 ```
 
@@ -120,31 +256,39 @@ const routes = HttpRouter.empty.pipe(
 import { NodeHttpServer } from "@effect/platform-node"
 import { createServer } from "node:http"
 
-const serverLayer = NodeHttpServer.layer(createServer, { port: 3000 })
+const ServerLayer = NodeHttpServer.layer(createServer, { port: 3000 })
 ```
+
+`NodeHttpServer.layerConfig(...)` reads the listen options from `Config`, and
+`NodeHttpServer.layerTest` provides an ephemeral-port server for integration
+tests.
 
 ### Bun
 
 ```typescript
 import { BunHttpServer } from "@effect/platform-bun"
 
-const serverLayer = BunHttpServer.layer({ port: 3000 })
+const ServerLayer = BunHttpServer.layer({ port: 3000 })
 ```
 
 ## Web handler
 
-Create a web handler for serverless environments:
+For serverless and edge runtimes, `HttpRouter.toWebHandler` returns a standard
+`(request: Request) => Promise<Response>` function plus a `dispose` for
+cleanup:
 
 ```typescript
-const { handler, dispose } = HttpRouter.toWebHandler(
-  routes.pipe(Layer.provide(HttpServer.layerServices))
-)
+import { HttpRouter } from "effect/unstable/http"
 
-// Use in serverless function
+const { handler, dispose } = HttpRouter.toWebHandler(AppLayer, {
+  disableLogger: true
+})
+
+// Use `handler` as the default export of your serverless function
 export default handler
 ```
 
 ## See also
 
-- [HTTP Client](/unstable/http-client) - Make HTTP requests
-- [HTTP API](/unstable/http-api) - Build schema-first APIs
+- [HTTP Client](/unstable/http-client) — make HTTP requests
+- [HTTP API](/unstable/http-api) — build schema-first APIs
