@@ -30,10 +30,15 @@ Effect v4 represents a major evolution of the Effect ecosystem with:
 - Renamed `WorkflowEngine.layer` (breaking change)
 - Fixed `Workflow.executionId` to use schema `makeUnsafe`
 - Fixed spans never having parent span
+- Fixed `Graph.hasEdge` to treat undirected edges symmetrically
+- Fixed `Graph.reverse` to no-op on undirected graphs and preserve directed adjacency invariants
+- Fixed `Graph.dijkstra` and `Graph.astar` to validate edge weights before returning early
+- Tightened `Graph` topological sort initials and restricted strongly connected components to directed graphs
 
 ### New Features
 
 - Added `Effect.findFirst` and `Effect.findFirstFilter` for short-circuiting effectful searches
+- Added `Graph.successors` and `Graph.predecessors` for explicit directed neighbor traversal (deprecates `Graph.neighborsDirected`)
 
 ## Recent Changes
 
