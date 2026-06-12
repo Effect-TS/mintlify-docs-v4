@@ -91,6 +91,16 @@ const logLevel = Config.string("LOG_LEVEL").pipe(
 )
 ```
 
+`Config.withDefault` only recovers when the underlying value is **missing**
+(the key is absent or undefined). If a value is present but fails validation —
+for example a non-numeric `PORT`, an out-of-range number, or any other schema
+filter failure — the error propagates instead of falling back to the default.
+This prevents invalid configuration from being silently masked.
+
+Use [`Config.orElse`](#orelse) when you want to recover from all errors, or
+[`Config.option`](#optional-configuration) to surface a missing value as
+`Option.none`.
+
 ### Optional Configuration
 
 ```ts
