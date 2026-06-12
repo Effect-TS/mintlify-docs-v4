@@ -91,6 +91,10 @@ const logLevel = Config.string("LOG_LEVEL").pipe(
 )
 ```
 
+<Note>
+  `Config.withDefault` only falls back to the default when the underlying value is **missing** (missing keys or undefined values). If the value is present but fails validation — for example, a string that doesn't match a literal union, or a number that is out of range — the validation error propagates instead of being replaced by the default. Use `Config.orElse` if you want to recover from all errors, not just missing data.
+</Note>
+
 ### Optional Configuration
 
 ```ts
