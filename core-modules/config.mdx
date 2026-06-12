@@ -91,6 +91,14 @@ const logLevel = Config.string("LOG_LEVEL").pipe(
 )
 ```
 
+<Note>
+  `Config.withDefault` only applies when the value is missing (missing keys or
+  `undefined`). If the value is present but fails validation — wrong type, out
+  of range, or any schema filter (e.g. `Schema.NonEmptyString`, `Schema.int()`)
+  — the error propagates instead of falling back to the default. Use
+  [`Config.orElse`](#orelse) if you also need to recover from validation failures.
+</Note>
+
 ### Optional Configuration
 
 ```ts
