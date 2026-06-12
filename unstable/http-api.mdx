@@ -336,6 +336,137 @@ const AuthorizationClient = HttpApiMiddleware.layerClient(
 )
 ```
 
+## Streaming responses
+
+Use streaming success schemas when an endpoint produces data incrementally —
+Server-Sent Events for live updates, or raw byte streams for large downloads.
+Handlers return a `Stream`, and the typed client consumes one.
+
+Two schema constructors live on `HttpApiSchema`:
+
+- `StreamSse` — Server-Sent Events. Set `events` to a schema describing each
+  event, or `data` to a schema describing the JSON payload of a `message`
+  event. An optional `error` schema types the failure channel of the stream.
+- `StreamUint8Array` — a raw `Uint8Array` byte stream, defaulting to
+  `application/octet-stream`.
+
+Both accept an optional `contentType` and compose with
+`HttpApiSchema.status(...)` to pin a specific status code. You can also list a
+streaming schema alongside a buffered one in `success` to let a single endpoint
+return either based on the request.
+
+### Server-Sent Events
+
+```typescript
+import { Effect, Schema, Stream } from "effect"
+import {
+  HttpApiEndpoint,
+  HttpApiGroup,
+  HttpApiSchema
+} from "effect/unstable/httpapi"
+
+const StreamError = Schema.Struct({ reason: Schema.String })
+
+const ChatEvent = Schema.Struct({
+  event: Schema.String,
+  data: Schema.String
+})
+
+class ChatApi extends HttpApiGroup.make("chat")
+  .add(
+    HttpApiEndpoint.get("events", "/events", {
+      success: HttpApiSchema.StreamSse({
+        events: ChatEvent,
+        error: StreamError
+      })
+    })
+  ) {}
+```
+
+A handler returns a `Stream` of events. Stream failures are encoded into a
+reserved SSE event so the client can re-raise them as a typed error:
+
+```typescript
+import { HttpApiBuilder } from "effect/unstable/httpapi"
+
+const ChatApiHandlers = HttpApiBuilder.group(
+  Api,
+  "chat",
+  (handlers) =>
+    handlers.handle("events", () =>
+      Effect.succeed(
+        Stream.make(
+          { event: "first", data: "one" },
+          { event: "second", data: "two" }
+        )
+      )
+    )
+)
+```
+
+Pass `data` instead of `events` when you only care about a JSON payload — the
+event name defaults to `message` and the handler emits and the client receives
+the decoded values directly:
+
+```typescript
+const Tick = Schema.Struct({ count: Schema.Number })
+
+HttpApiEndpoint.get("ticks", "/ticks", {
+  success: HttpApiSchema.StreamSse({ data: Tick })
+})
+```
+
+### Byte streams
+
+`StreamUint8Array` is for downloads or any binary payload produced
+incrementally. The handler returns a `Stream<Uint8Array>` and the client
+receives one back:
+
+```typescript
+class FilesApi extends HttpApiGroup.make("files")
+  .add(
+    HttpApiEndpoint.get("download", "/files/:id", {
+      params: Schema.Struct({ id: Schema.String }),
+      success: HttpApiSchema.StreamUint8Array({
+        contentType: "application/pdf"
+      })
+    })
+  ) {}
+```
+
+### Consuming streams from the client
+
+Calling a streaming endpoint on the generated client returns a `Stream`
+directly — no extra unwrapping. Failures encoded by the server surface as
+typed errors in the stream:
+
+```typescript
+const program = Effect.gen(function*() {
+  const client = yield* HttpApiClient.make(Api, {
+    baseUrl: "http://localhost:3000"
+  })
+
+  yield* client.chat.events({}).pipe(
+    Stream.runForEach((event) => Effect.log(event))
+  )
+})
+```
+
+### Mixing streaming and buffered responses
+
+A single endpoint can declare both a buffered and a streaming schema in
+`success`. The handler returns whichever value matches the request:
+
+```typescript
+HttpApiEndpoint.get("chat", "/chat", {
+  query: { stream: Schema.String },
+  success: [
+    Schema.Struct({ message: Schema.String }),
+    HttpApiSchema.StreamSse({ data: ChatEvent, error: StreamError })
+  ]
+})
+```
+
 ## Security schemes
 
 `HttpApiSecurity` describes how an endpoint or group authenticates requests.
